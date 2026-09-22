@@ -1,0 +1,38 @@
+# Builds MonsterShooterSetup.exe on a real Windows machine: PyInstaller does not
+# cross-compile, so the .exe cannot be made from macOS or Linux.
+name: Windows setup tool
+
+on:
+  push:
+    paths:
+      - "extras/scripts/**"
+      - "extras/livearea/icon0.png"
+      - ".github/workflows/setup-tool.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      # No submodules: the setup tool needs none of the loader's dependencies.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Self-tests
+        working-directory: extras/scripts
+        run: |
+          python extract_apk.py --selftest
+          python setup_gui.py --selftest
+
+      - name: Build the .exe
+        run: |
+          pip install pyinstaller pillow
+          pyinstaller --onefile --windowed --name MonsterShooterSetup --icon extras/livearea/icon0.png --paths extras/scripts extras/scripts/setup_gui.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MonsterShooterSetup
+          path: dist/MonsterShooterSetup.exe
