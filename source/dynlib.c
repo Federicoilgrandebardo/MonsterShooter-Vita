@@ -150,298 +150,9 @@ static void *mremap_stub(void *old, size_t oldsz, size_t newsz, int flags) { ret
 static struct mallinfo mallinfo_stub(void) { struct mallinfo mi; memset(&mi, 0, sizeof(mi)); return mi; }
 
 
-// Stato dell'array colori, condiviso fra le sonde.
+// Stato GL che serve a hud_filter: texture per unita' e puntatori degli array.
 static GLuint g_bound_tex[4] = {0,0,0,0};
-static GLsizei g_tex_w[64] = {0}, g_tex_h[64] = {0};
 static GLenum g_active_unit = 0x84C0;
-static int g_tex2d_on[4] = {0,0,0,0};
-static const unsigned char *g_col_ptr = NULL;
-static GLsizei g_col_stride = 0;
-static GLenum g_col_type = 0;
-static GLint g_col_size = 0;
-static int g_col_enabled = 0;
-
-// --- sonde diagnostiche texture (rimuovere quando la UI funziona) ---
-// La UI appare come rettangoli bianchi/grigi: geometria giusta, texture assente.
-// Serve sapere quale formato il gioco sceglie e con quali parametri carica.
-static void glCompressedTexImage2D_probe(GLenum target, GLint level, GLenum fmt,
-                                         GLsizei w, GLsizei h, GLint border,
-                                         GLsizei imgsize, const void *data) {
-    { unsigned id = g_bound_tex[(g_active_unit - 0x84C0u) < 4 ? (g_active_unit - 0x84C0u) : 0];
-      if (id < 64) { g_tex_w[id] = w; g_tex_h[id] = h; } }
-    l_debug("upload ETC1 su tex id %u (unit %u): %ix%i size=%i",
-            g_bound_tex[(g_active_unit - 0x84C0u) < 4 ? (g_active_unit - 0x84C0u) : 0],
-            (unsigned)(g_active_unit - 0x84C0u), w, h, imgsize);
-    glCompressedTexImage2D(target, level, fmt, w, h, border, imgsize, data);
-    GLenum e = glGetError();
-    if (e) l_warn("  -> glGetError 0x%x", e);
-}
-
-static void glTexImage2D_probe(GLenum target, GLint level, GLint internalfmt,
-                               GLsizei w, GLsizei h, GLint border,
-                               GLenum fmt, GLenum type, const void *data) {
-    { unsigned id = g_bound_tex[(g_active_unit - 0x84C0u) < 4 ? (g_active_unit - 0x84C0u) : 0];
-      if (id < 64) { g_tex_w[id] = w; g_tex_h[id] = h; } }
-    l_debug("upload RGBA su tex id %u (unit %u): %ix%i ifmt=0x%x",
-            g_bound_tex[(g_active_unit - 0x84C0u) < 4 ? (g_active_unit - 0x84C0u) : 0],
-            (unsigned)(g_active_unit - 0x84C0u), w, h, internalfmt);
-    glTexImage2D(target, level, internalfmt, w, h, border, fmt, type, data);
-    GLenum e = glGetError();
-    if (e) l_warn("  -> glGetError 0x%x", e);
-}
-
-static const GLubyte * glGetString_probe(GLenum name) {
-    const GLubyte *r = glGetString(name);
-    l_debug("glGetString(0x%x) = %s", name, r ? (const char *)r : "(null)");
-    return r;
-}
-
-
-// Sonda combiner: il gioco carica coppie di atlas ETC1 (RGB + alpha) e li fonde
-// con il texture combiner. Logga solo i cambi di stato, non ogni frame.
-// sonde sulla coda di input - rimuovere a bug chiuso.
-// Domanda: durante la schermata di caricamento il gioco LEGGE ancora l'input?
-// Se smette di interrogare la coda, non sta aspettando un tocco.
-static int32_t AInputQueue_hasEvents_probe(AInputQueue *q) {
-    static unsigned n = 0, got = 0;
-    int32_t r = AInputQueue_hasEvents(q);
-    n++;
-    if (r > 0) got++;
-    if ((n % 300) == 0)
-        l_debug("[IN] hasEvents interrogata %u volte, eventi disponibili %u", n, got);
-    return r;
-}
-
-static int32_t AInputQueue_getEvent_probe(AInputQueue *q, AInputEvent **out) {
-    int32_t r = AInputQueue_getEvent(q, out);
-    // Su Android il filmato e' una VideoView Java che si prende l'input: il
-    // nativo non vede tasti finche' non finisce. Qui si scartano, altrimenti
-    // un tasto durante cs1 arriva a GameplayJob prima che esista il
-    // GameManager e crasha in GameManager::KeyPressed (VERIFICATO, core dump).
-    while (r >= 0 && movie_active()) {
-        AInputQueue_finishEvent(q, *out, 1);
-        r = AInputQueue_getEvent(q, out);
-    }
-    static int budget = 40;
-    if (budget > 0 && r >= 0) {
-        budget--;
-        l_debug("[IN] getEvent -> %d (il gioco ha PRESO un evento)", (int)r);
-    }
-    return r;
-}
-
-// sonda sul ciclo di vita dei thread - rimuovere a bug chiuso.
-// Il thread di caricamento si ferma dopo il fallimento del sync: qui si vede
-// se ESCE (la sua funzione ritorna) o se resta appeso dentro.
-typedef struct { void *(*start)(void *); void *arg; int id; } thr_probe_t;
-
-static void *thread_trampoline(void *p) {
-    thr_probe_t *t = (thr_probe_t *)p;
-    int id = t->id;
-    void *(*start)(void *) = t->start;
-    void *arg = t->arg;
-    free(t);
-    l_debug("[THR] #%d entra (start=%p)", id, (void *)start);
-    void *r = start(arg);
-    l_debug("[THR] #%d ESCE (start=%p, ret=%p)", id, (void *)start, r);
-    return r;
-}
-
-static int pthread_create_probe(pthread_t *thread, const pthread_attr_t_bionic *attr,
-                                void *(*start)(void *), void *param) {
-    static int seq = 0;
-    thr_probe_t *t = (thr_probe_t *)malloc(sizeof(thr_probe_t));
-    if (!t)
-        return pthread_create_soloader(thread, attr, start, param);
-    t->start = start; t->arg = param; t->id = ++seq;
-    l_debug("[THR] #%d creato (start=%p)", t->id, (void *)start);
-    int r = pthread_create_soloader(thread, attr, thread_trampoline, t);
-    if (r != 0) { l_debug("[THR] #%d CREAZIONE FALLITA (%d)", t->id, r); free(t); }
-    return r;
-}
-
-// sonde di rete. I server Gamelion sono spenti da anni; se il
-// caricamento aspetta una risposta che non arriva, si vede qui.
-static struct hostent *gethostbyname_probe(const char *name) {
-    l_debug("[NET] gethostbyname(\"%s\")", name ? name : "(null)");
-    struct hostent *r = gethostbyname(name);
-    l_debug("[NET] gethostbyname(\"%s\") -> %s", name ? name : "(null)", r ? "ok" : "NULL");
-    return r;
-}
-
-static int connect_probe(int fd, const struct sockaddr *addr, socklen_t len) {
-    l_debug("[NET] connect(fd=%d) inizio", fd);
-    int r = connect(fd, addr, len);
-    l_debug("[NET] connect(fd=%d) -> %d (errno %d)", fd, r, errno);
-    return r;
-}
-
-static void glTexEnvi_probe(GLenum target, GLenum pname, GLint param) {
-    static GLenum lt = 0xffff; static GLenum lp = 0xffff; static GLint lv = -12345;
-    static int budget = 60;  // il combiner si riconfigura a ogni frame
-    if (budget > 0 && (target != lt || pname != lp || param != lv)) {
-        budget--;
-        l_debug("glTexEnvi(target=0x%x pname=0x%x param=0x%x)", target, pname, param);
-        lt = target; lp = pname; lv = param;
-    }
-    glTexEnvi(target, pname, param);
-}
-
-static void glClientActiveTexture_probe(GLenum unit) {
-    static GLenum last = 0xffff;
-    if (unit != last) { l_debug("glClientActiveTexture(0x%x)", unit); last = unit; }
-    glClientActiveTexture(unit);
-}
-
-static void glBlendFunc_probe(GLenum src, GLenum dst) {
-    static GLenum ls = 0xffff; static GLenum ld = 0xffff;
-    if (src != ls || dst != ld) { l_debug("glBlendFunc(0x%x, 0x%x)", src, dst); ls = src; ld = dst; }
-    glBlendFunc(src, dst);
-}
-
-
-// Sonda FBO: il gioco usa render-to-texture. Se la UI viene disegnata su un
-// framebuffer incompleto, il risultato e' un quad bianco senza errori GL.
-static GLenum glCheckFramebufferStatusOES_probe(GLenum target) {
-    GLenum st = glCheckFramebufferStatus(target);
-    static GLenum last = 0;
-    if (st != last) {
-        l_debug("glCheckFramebufferStatus(0x%x) = 0x%x %s", target, st,
-                st == 0x8CD5 ? "(COMPLETE)" : "(INCOMPLETO!)");
-        last = st;
-    }
-    return st;
-}
-
-static void glFramebufferTexture2DOES_probe(GLenum target, GLenum att, GLenum textarget,
-                                            GLuint tex, GLint level) {
-    static int budget = 20;
-    if (budget > 0) {
-        budget--;
-        l_debug("glFramebufferTexture2D(t=0x%x att=0x%x tex=%u lvl=%i)", target, att, tex, level);
-    }
-    glFramebufferTexture2D(target, att, textarget, tex, level);
-    GLenum e = glGetError();
-    if (e) l_warn("  -> glGetError 0x%x", e);
-}
-
-static void glBindFramebufferOES_probe(GLenum target, GLuint fb) {
-    static int budget = 20;
-    if (budget > 0) { budget--; l_debug("glBindFramebuffer(0x%x, %u)", target, fb); }
-    glBindFramebuffer(target, fb);
-}
-
-static void glRenderbufferStorageOES_probe(GLenum target, GLenum fmt, GLsizei w, GLsizei h) {
-    static int budget = 20;
-    if (budget > 0) { budget--; l_debug("glRenderbufferStorage(fmt=0x%x %ix%i)", fmt, w, h); }
-    glRenderbufferStorage(target, fmt, w, h);
-    GLenum e = glGetError();
-    if (e) l_warn("  -> glGetError 0x%x", e);
-}
-
-
-static void glEnableClientState_probe(GLenum a) {
-    if (a == 0x8076) g_col_enabled = 1;  // GL_COLOR_ARRAY
-    static int budget = 24;
-    if (budget > 0) { budget--; l_debug("glEnableClientState(0x%x)", a); }
-    glEnableClientState(a);
-}
-
-static void glDisableClientState_probe(GLenum a) {
-    if (a == 0x8076) g_col_enabled = 0;
-    static int budget = 24;
-    if (budget > 0) { budget--; l_debug("glDisableClientState(0x%x)", a); }
-    glDisableClientState(a);
-}
-
-static void glEnable_probe(GLenum c) {
-    if (c == 0xDE1) { unsigned u = g_active_unit - 0x84C0u; if (u < 4) g_tex2d_on[u] = 1; }
-    static int budget = 30;
-    if (budget > 0) { budget--; l_debug("glEnable(0x%x)", c); }
-    glEnable(c);
-}
-
-static void glDisable_probe(GLenum c) {
-    if (c == 0xDE1) { unsigned u = g_active_unit - 0x84C0u; if (u < 4) g_tex2d_on[u] = 0; }
-    static int budget = 30;
-    if (budget > 0) { budget--; l_debug("glDisable(0x%x)", c); }
-    glDisable(c);
-}
-
-
-// Clipping: il gioco importa glScissor. Se lo scissor rect e' calcolato su una
-// risoluzione diversa da 960x544, o con l'origine Y invertita, la UI viene
-// tagliata via senza alcun errore GL. Mai sondato finora.
-static void glScissor_probe(GLint x, GLint y, GLsizei w, GLsizei h) {
-    static GLint lx = -1, ly = -1; static GLsizei lw = -1, lh = -1;
-    if (x != lx || y != ly || w != lw || h != lh) {
-        l_debug("glScissor(x=%i y=%i w=%i h=%i)", x, y, w, h);
-        lx = x; ly = y; lw = w; lh = h;
-    }
-    glScissor(x, y, w, h);
-}
-
-static void glViewport_probe(GLint x, GLint y, GLsizei w, GLsizei h) {
-    static GLint lx = -1, ly = -1; static GLsizei lw = -1, lh = -1;
-    if (x != lx || y != ly || w != lw || h != lh) {
-        l_debug("glViewport(x=%i y=%i w=%i h=%i)", x, y, w, h);
-        lx = x; ly = y; lw = w; lh = h;
-    }
-    glViewport(x, y, w, h);
-}
-
-static void glOrthof_probe(GLfloat l, GLfloat r, GLfloat b, GLfloat t, GLfloat n, GLfloat f) {
-    static int budget = 12;
-    if (budget > 0) {
-        budget--;
-        l_debug("glOrthof(l=%i r=%i b=%i t=%i n=%i f=%i)",
-                (int)l, (int)r, (int)b, (int)t, (int)n, (int)f);
-    }
-    glOrthof(l, r, b, t, n, f);
-}
-
-
-// Conta glClear ed eglSwapBuffers: se il gioco pulisce meno spesso di quanto
-// scambia, sta assumendo un framebuffer preservato fra i frame.
-static unsigned g_clears = 0, g_swaps = 0;
-
-// Due glClear per ogni swap: il gioco fa due passate di rendering per frame.
-// Il mask dice quale delle due tocca il colore — se la seconda pulisce il
-// COLOR_BUFFER dopo aver disegnato, cancella quello appena messo a schermo.
-// VERIFICATO: il gioco fa due glClear(GL_COLOR_BUFFER_BIT) per ogni
-// eglSwapBuffers, quindi il primo disegno del frame viene cancellato dal
-// secondo clear e non arriva mai a schermo.
-// TEST: eseguo solo il primo clear di ogni frame, ignoro i successivi finche'
-// non arriva lo swap. Se la UI compare, la causa e' confermata.
-static int g_cleared_this_frame = 0;
-
-static unsigned g_draws_since_clear = 0;
-static unsigned g_ui_since_clear = 0;
-static unsigned g_group = 0;
-
-static void glClear_probe(GLbitfield mask) {
-    g_clears++;
-    // Registro cosa conteneva il gruppo di draw appena concluso.
-    if (mask & 0x4000) {
-        static int budget = 20;
-        if (budget > 0 && g_group < 200) {
-            budget--;
-            l_debug("[CLEAR] gruppo chiuso: %u draw, di cui %u con texture UI",
-                    g_draws_since_clear, g_ui_since_clear);
-        }
-        g_group++;
-        g_draws_since_clear = 0;
-        g_ui_since_clear = 0;
-    }
-    // TESTATO E SMENTITO: sopprimere il secondo clear del colore non fa
-    // ricomparire la UI, quindi il primo disegno non e' quello perso.
-    (void)g_cleared_this_frame;
-    glClear(mask);
-}
-
-static unsigned g_draws = 0;
-
-// Controlli a schermo nascosti: stato degli array per hud_filter.
 static const void *g_vtx_ptr = NULL;
 static GLint g_vtx_size = 0;
 static GLenum g_vtx_type = 0;
@@ -450,6 +161,17 @@ static const float *g_tc_ptr = NULL;
 static GLsizei g_tc_stride = 0;
 static GLenum g_tc_type = 0;
 static GLuint g_vbo = 0, g_ibo = 0;
+
+static void glBindTexture_hook(GLenum target, GLuint tex) {
+    unsigned u = g_active_unit - 0x84C0u;
+    if (u < 4) g_bound_tex[u] = tex;
+    glBindTexture(target, tex);
+}
+
+static void glActiveTexture_hook(GLenum unit) {
+    g_active_unit = unit;
+    glActiveTexture(unit);
+}
 
 static void glVertexPointer_hook(GLint size, GLenum type, GLsizei stride, const void *ptr) {
     g_vtx_size = size; g_vtx_type = type; g_vtx_stride = stride; g_vtx_ptr = ptr;
@@ -465,6 +187,19 @@ static void glBindBuffer_hook(GLenum target, GLuint buf) {
     if (target == 0x8892) g_vbo = buf;       // GL_ARRAY_BUFFER
     else if (target == 0x8893) g_ibo = buf;  // GL_ELEMENT_ARRAY_BUFFER
     glBindBuffer(target, buf);
+}
+
+// Su Android il filmato e' una VideoView Java che si prende l'input: il nativo
+// non vede tasti finche' non finisce. Qui si scartano, altrimenti un tasto
+// durante cs1 arriva a GameplayJob prima che esista il GameManager e crasha in
+// GameManager::KeyPressed (VERIFICATO, core dump).
+static int32_t AInputQueue_getEvent_hook(AInputQueue *q, AInputEvent **out) {
+    int32_t r = AInputQueue_getEvent(q, out);
+    while (r >= 0 && movie_active()) {
+        AInputQueue_finishEvent(q, *out, 1);
+        r = AInputQueue_getEvent(q, out);
+    }
+    return r;
 }
 
 // Angolo UV (pixel dell'atlante HUD 2048x2048) delle fette che compongono gli
@@ -525,108 +260,14 @@ static int hud_filter(GLenum mode, GLsizei count, GLenum type, const void *idx) 
     return 1;
 }
 
-static void glDrawElements_probe(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+static void glDrawElements_hook(GLenum mode, GLsizei count, GLenum type, const void *idx) {
     if (vsticks_hidden && hud_filter(mode, count, type, idx)) return;
-    g_draws++;
-    g_draws_since_clear++;
-    // "draw UI" = quad da 6 indici con texture attiva: sono le icone.
-    if (count == 6 && g_tex2d_on[0] && g_bound_tex[0] != 0)
-        g_ui_since_clear++;
-    // Campiono solo le draw con array colori attivo e formato byte: sono quelle
-    // che portano l'alpha al combiner.
-    if (g_col_enabled && g_col_ptr && g_col_type == 0x1401 && g_col_size == 4) {
-        static int budget = 25;
-        if (budget > 0) {
-            budget--;
-            const unsigned char *c = g_col_ptr;
-            unsigned t0 = g_bound_tex[0];
-            l_debug("draw count=%i rgba=%u,%u,%u,%u | tex0=%u(%ix%i on=%i) tex1=%u(on=%i)",
-                    count, c[0], c[1], c[2], c[3],
-                    t0, t0 < 64 ? g_tex_w[t0] : -1, t0 < 64 ? g_tex_h[t0] : -1,
-                    g_tex2d_on[0], g_bound_tex[1], g_tex2d_on[1]);
-        }
-    }
     glDrawElements(mode, count, type, idx);
 }
 
-static unsigned int eglSwapBuffers_probe(void *dpy, void *surf) {
-    g_swaps++;
-    g_cleared_this_frame = 0;
-    {
-        static int budget = 20;
-        if (budget > 0 && g_group < 200) {
-            budget--;
-            l_debug("[SWAP ] ultimo gruppo: %u draw, di cui %u con texture UI  <-- QUESTO SI VEDE",
-                    g_draws_since_clear, g_ui_since_clear);
-        }
-    }
-    g_draws_since_clear = 0;
-    g_ui_since_clear = 0;
-    if (g_swaps == 30 || (g_swaps % 300) == 0)
-        l_debug("frame %u: clear=%u swap=%u draw=%u (clear/frame %.2f, draw/frame %.1f)",
-                g_swaps, g_clears, g_swaps, g_draws,
-                (double)g_clears / (double)g_swaps, (double)g_draws / (double)g_swaps);
+static unsigned int eglSwapBuffers_hook(void *dpy, void *surf) {
     movie_draw(); // no-op se non c'e' un filmato
     return eglSwapBuffers(dpy, surf);
-}
-
-
-// TEST DECISIVO: leggere l'alpha reale nei vertici della UI.
-// Il combiner prende l'alpha da GL_PRIMARY_COLOR, cioe' da questo array.
-// alpha 0   -> e' il gioco a volere la UI invisibile (causa nella sua logica)
-// alpha 255 -> il gioco la vuole opaca, qualcosa a valle la annulla (causa nel rendering)
-static void glColorPointer_probe(GLint size, GLenum type, GLsizei stride, const void *ptr) {
-    g_col_ptr = (const unsigned char *)ptr;
-    g_col_stride = stride ? stride : (GLsizei)(size * (type == 0x1401 ? 1 : 4));
-    g_col_type = type;
-    g_col_size = size;
-    static GLint ls = -1; static GLenum lt = 0; static GLsizei lst = -1;
-    if (size != ls || type != lt || stride != lst) {
-        l_debug("glColorPointer(size=%i type=0x%x stride=%i)", size, type, stride);
-        ls = size; lt = type; lst = stride;
-    }
-    glColorPointer(size, type, stride, ptr);
-}
-
-static void glBindTexture_probe(GLenum target, GLuint tex) {
-    unsigned u = (g_active_unit - 0x84C0u);
-    if (u < 4) g_bound_tex[u] = tex;
-    glBindTexture(target, tex);
-}
-
-static void glActiveTexture_probe(GLenum unit) {
-    g_active_unit = unit;
-    glActiveTexture(unit);
-}
-
-static void glGenTextures_probe(GLsizei n, GLuint *out) {
-    glGenTextures(n, out);
-    static int budget = 14;
-    if (budget > 0 && n > 0) {
-        budget--;
-        l_debug("glGenTextures(n=%i) -> primo id %u", n, out[0]);
-    }
-}
-
-static void glDeleteTextures_probe(GLsizei n, const GLuint *ids) {
-    static int budget = 14;
-    if (budget > 0 && n > 0) {
-        budget--;
-        l_debug("glDeleteTextures(n=%i) primo id %u", n, ids[0]);
-    }
-    glDeleteTextures(n, ids);
-}
-
-static void glTexEnvfv_probe(GLenum target, GLenum pname, GLfloat *param) {
-    static int budget = 10;
-    if (budget > 0 && pname == 0x2201) {  // GL_TEXTURE_ENV_COLOR
-        budget--;
-        l_debug("costante combiner (unit %u): %i,%i,%i,%i (millesimi)",
-                (unsigned)(g_active_unit - 0x84C0u),
-                (int)(param[0]*1000), (int)(param[1]*1000),
-                (int)(param[2]*1000), (int)(param[3]*1000));
-    }
-    glTexEnvfv(target, pname, param);
 }
 
 so_default_dynlib default_dynlib[] = {
@@ -785,8 +426,8 @@ so_default_dynlib default_dynlib[] = {
         {"AInputQueue_attachLooper", (uintptr_t)&AInputQueue_attachLooper},
         {"AInputQueue_detachLooper", (uintptr_t)&AInputQueue_detachLooper},
         {"AInputQueue_finishEvent", (uintptr_t)&AInputQueue_finishEvent},
-        {"AInputQueue_getEvent", (uintptr_t)&AInputQueue_getEvent_probe},
-        {"AInputQueue_hasEvents", (uintptr_t)&AInputQueue_hasEvents_probe},
+        {"AInputQueue_getEvent", (uintptr_t)&AInputQueue_getEvent_hook},
+        {"AInputQueue_hasEvents", (uintptr_t)&AInputQueue_hasEvents},
         {"AInputQueue_preDispatchEvent", (uintptr_t)&AInputQueue_preDispatchEvent},
         {"AKeyEvent_getAction", (uintptr_t)&AKeyEvent_getAction},
         {"AKeyEvent_getKeyCode", (uintptr_t)&AKeyEvent_getKeyCode},
@@ -872,12 +513,12 @@ so_default_dynlib default_dynlib[] = {
         // Sockets
         { "accept", (uintptr_t)&accept },
         { "bind", (uintptr_t)&bind },
-        { "connect", (uintptr_t)&connect_probe },
+        { "connect", (uintptr_t)&connect },
         { "freeaddrinfo", (uintptr_t)&freeaddrinfo },
         { "gai_strerror", (uintptr_t)&ret0 },
         { "getaddrinfo", (uintptr_t)&getaddrinfo },
         { "gethostbyaddr", (uintptr_t)&gethostbyaddr },
-        { "gethostbyname", (uintptr_t)&gethostbyname_probe },
+        { "gethostbyname", (uintptr_t)&gethostbyname },
         { "gethostname", (uintptr_t)&gethostname },
         { "getpeername", (uintptr_t)&getpeername },
         { "getservbyname", (uintptr_t)&getservbyname },
@@ -1073,22 +714,22 @@ so_default_dynlib default_dynlib[] = {
         { "eglQueryContext", (uintptr_t)&eglQueryContext },
         { "eglQueryString", (uintptr_t)&eglQueryString },
         { "eglQuerySurface", (uintptr_t)&eglQuerySurface },
-        { "eglSwapBuffers", (uintptr_t)&eglSwapBuffers_probe },
+        { "eglSwapBuffers", (uintptr_t)&eglSwapBuffers_hook },
         { "eglTerminate", (uintptr_t)&eglTerminate },
 
 
         // OpenGL
-        { "glActiveTexture", (uintptr_t)&glActiveTexture_probe },
+        { "glActiveTexture", (uintptr_t)&glActiveTexture_hook },
         { "glAlphaFunc", (uintptr_t)&glAlphaFunc },
         { "glAlphaFuncx", (uintptr_t)&glAlphaFuncx },
         { "glAttachShader", (uintptr_t)&glAttachShader },
         { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
         { "glBindBuffer", (uintptr_t)&glBindBuffer_hook },
         { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
-        { "glBindFramebufferOES", (uintptr_t)&glBindFramebufferOES_probe },
+        { "glBindFramebufferOES", (uintptr_t)&glBindFramebuffer },
         { "glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer },
         { "glBindRenderbufferOES", (uintptr_t)&glBindRenderbuffer },
-        { "glBindTexture", (uintptr_t)&glBindTexture_probe },
+        { "glBindTexture", (uintptr_t)&glBindTexture_hook },
         { "glBlendColor", (uintptr_t)&ret0 },
         { "glBlendEquation", (uintptr_t)&glBlendEquation },
         { "glBlendEquationOES", (uintptr_t)&glBlendEquation },
@@ -1100,8 +741,8 @@ so_default_dynlib default_dynlib[] = {
         { "glBufferData", (uintptr_t)&glBufferData },
         { "glBufferSubData", (uintptr_t)&glBufferSubData },
         { "glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus },
-        { "glCheckFramebufferStatusOES", (uintptr_t)&glCheckFramebufferStatusOES_probe },
-        { "glClear", (uintptr_t)&glClear_probe },
+        { "glCheckFramebufferStatusOES", (uintptr_t)&glCheckFramebufferStatus },
+        { "glClear", (uintptr_t)&glClear },
         { "glClearColor", (uintptr_t)&glClearColor },
         { "glClearColorx", (uintptr_t)&glClearColorx },
         { "glClearDepthf", (uintptr_t)&glClearDepthf },
@@ -1114,9 +755,9 @@ so_default_dynlib default_dynlib[] = {
         { "glColor4ub", (uintptr_t)&glColor4ub },
         { "glColor4x", (uintptr_t)&glColor4x },
         { "glColorMask", (uintptr_t)&glColorMask },
-        { "glColorPointer", (uintptr_t)&glColorPointer_probe },
+        { "glColorPointer", (uintptr_t)&glColorPointer },
         { "glCompileShader", (uintptr_t)&glCompileShader_soloader },
-        { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D_probe },
+        { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
         { "glCompressedTexSubImage2D", (uintptr_t)&ret0 },
         { "glCopyTexImage2D", (uintptr_t)&glCopyTexImage2D },
         { "glCopyTexSubImage2D", (uintptr_t)&glCopyTexSubImage2D },
@@ -1131,17 +772,17 @@ so_default_dynlib default_dynlib[] = {
         { "glDeleteRenderbuffers", (uintptr_t)&glDeleteRenderbuffers },
         { "glDeleteRenderbuffersOES", (uintptr_t)&glDeleteRenderbuffers },
         { "glDeleteShader", (uintptr_t)&glDeleteShader },
-        { "glDeleteTextures", (uintptr_t)&glDeleteTextures_probe },
+        { "glDeleteTextures", (uintptr_t)&glDeleteTextures },
         { "glDepthFunc", (uintptr_t)&glDepthFunc },
         { "glDepthMask", (uintptr_t)&glDepthMask },
         { "glDepthRangef", (uintptr_t)&glDepthRangef },
         { "glDepthRangex", (uintptr_t)&glDepthRangex },
         { "glDetachShader", (uintptr_t)&ret0 },
-        { "glDisable", (uintptr_t)&glDisable_probe },
-        { "glDisableClientState", (uintptr_t)&glDisableClientState_probe },
+        { "glDisable", (uintptr_t)&glDisable },
+        { "glDisableClientState", (uintptr_t)&glDisableClientState },
         { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
         { "glDrawArrays", (uintptr_t)&glDrawArrays },
-        { "glDrawElements", (uintptr_t)&glDrawElements_probe },
+        { "glDrawElements", (uintptr_t)&glDrawElements_hook },
         { "glDrawTexfOES", (uintptr_t)&ret0 },
         { "glDrawTexfvOES", (uintptr_t)&ret0 },
         { "glDrawTexiOES", (uintptr_t)&ret0 },
@@ -1152,8 +793,8 @@ so_default_dynlib default_dynlib[] = {
         { "glDrawTexxvOES", (uintptr_t)&ret0 },
         { "glEGLImageTargetRenderbufferStorageOES", (uintptr_t)&ret0 },
         { "glEGLImageTargetTexture2DOES", (uintptr_t)&ret0 },
-        { "glEnable", (uintptr_t)&glEnable_probe },
-        { "glEnableClientState", (uintptr_t)&glEnableClientState_probe },
+        { "glEnable", (uintptr_t)&glEnable },
+        { "glEnableClientState", (uintptr_t)&glEnableClientState },
         { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
         { "glFinish", (uintptr_t)&glFinish },
         { "glFlush", (uintptr_t)&glFlush },
@@ -1164,7 +805,7 @@ so_default_dynlib default_dynlib[] = {
         { "glFramebufferRenderbuffer", (uintptr_t)&glFramebufferRenderbuffer },
         { "glFramebufferRenderbufferOES", (uintptr_t)&glFramebufferRenderbuffer },
         { "glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2D },
-        { "glFramebufferTexture2DOES", (uintptr_t)&glFramebufferTexture2DOES_probe },
+        { "glFramebufferTexture2DOES", (uintptr_t)&glFramebufferTexture2D },
         { "glFrontFace", (uintptr_t)&glFrontFace },
         { "glFrustumf", (uintptr_t)&glFrustumf },
         { "glFrustumx", (uintptr_t)&glFrustumx },
@@ -1175,7 +816,7 @@ so_default_dynlib default_dynlib[] = {
         { "glGenFramebuffersOES", (uintptr_t)&glGenFramebuffers },
         { "glGenRenderbuffers", (uintptr_t)&glGenRenderbuffers },
         { "glGenRenderbuffersOES", (uintptr_t)&glGenRenderbuffers },
-        { "glGenTextures", (uintptr_t)&glGenTextures_probe },
+        { "glGenTextures", (uintptr_t)&glGenTextures },
         { "glGetActiveAttrib", (uintptr_t)&glGetActiveAttrib },
         { "glGetActiveUniform", (uintptr_t)&glGetActiveUniform },
         { "glGetAttribLocation", (uintptr_t)&glGetAttribLocation },
@@ -1200,7 +841,7 @@ so_default_dynlib default_dynlib[] = {
         { "glGetShaderInfoLog", (uintptr_t)&glGetShaderInfoLog },
         { "glGetShaderSource", (uintptr_t)&glGetShaderSource },
         { "glGetShaderiv", (uintptr_t)&glGetShaderiv },
-        { "glGetString", (uintptr_t)&glGetString_probe },
+        { "glGetString", (uintptr_t)&glGetString },
         { "glGetTexEnvfv", (uintptr_t)&ret0 },
         { "glGetTexEnviv", (uintptr_t)&glGetTexEnviv },
         { "glGetTexEnvxv", (uintptr_t)&ret0 },
@@ -1249,7 +890,7 @@ so_default_dynlib default_dynlib[] = {
         { "glNormal3f", (uintptr_t)&glNormal3f },
         { "glNormal3x", (uintptr_t)&glNormal3x },
         { "glNormalPointer", (uintptr_t)&glNormalPointer },
-        { "glOrthof", (uintptr_t)&glOrthof_probe },
+        { "glOrthof", (uintptr_t)&glOrthof },
         { "glOrthox", (uintptr_t)&glOrthox },
         { "glPixelStorei", (uintptr_t)&glPixelStorei },
         { "glPointParameterf", (uintptr_t)&ret0 },
@@ -1266,14 +907,14 @@ so_default_dynlib default_dynlib[] = {
         { "glQueryMatrixxOES", (uintptr_t)&ret0 },
         { "glReadPixels", (uintptr_t)&glReadPixels },
         { "glRenderbufferStorage", (uintptr_t)&glRenderbufferStorage },
-        { "glRenderbufferStorageOES", (uintptr_t)&glRenderbufferStorageOES_probe },
+        { "glRenderbufferStorageOES", (uintptr_t)&glRenderbufferStorage },
         { "glRotatef", (uintptr_t)&glRotatef },
         { "glRotatex", (uintptr_t)&glRotatex },
         { "glSampleCoverage", (uintptr_t)&ret0 },
         { "glSampleCoveragex", (uintptr_t)&ret0 },
         { "glScalef", (uintptr_t)&glScalef },
         { "glScalex", (uintptr_t)&glScalex },
-        { "glScissor", (uintptr_t)&glScissor_probe },
+        { "glScissor", (uintptr_t)&glScissor },
         { "glShadeModel", (uintptr_t)&glShadeModel },
         { "glShaderSource", (uintptr_t)&glShaderSource_soloader },
         { "glStencilFunc", (uintptr_t)&glStencilFunc },
@@ -1283,8 +924,8 @@ so_default_dynlib default_dynlib[] = {
         { "glStencilOpSeparate", (uintptr_t)&glStencilOpSeparate },
         { "glTexCoordPointer", (uintptr_t)&glTexCoordPointer_hook },
         { "glTexEnvf", (uintptr_t)&glTexEnvf },
-        { "glTexEnvfv", (uintptr_t)&glTexEnvfv_probe },
-        { "glTexEnvi", (uintptr_t)&glTexEnvi_probe },
+        { "glTexEnvfv", (uintptr_t)&glTexEnvfv },
+        { "glTexEnvi", (uintptr_t)&glTexEnvi },
         { "glTexEnviv", (uintptr_t)&ret0 },
         { "glTexEnvx", (uintptr_t)&glTexEnvx },
         { "glTexEnvxv", (uintptr_t)&glTexEnvxv },
@@ -1294,7 +935,7 @@ so_default_dynlib default_dynlib[] = {
         { "glTexGenivOES", (uintptr_t)&ret0 },
         { "glTexGenxOES", (uintptr_t)&ret0 },
         { "glTexGenxvOES", (uintptr_t)&ret0 },
-        { "glTexImage2D", (uintptr_t)&glTexImage2D_probe },
+        { "glTexImage2D", (uintptr_t)&glTexImage2D },
         { "glTexParameterf", (uintptr_t)&glTexParameterf },
         { "glTexParameterfv", (uintptr_t)&ret0 },
         { "glTexParameteri", (uintptr_t)&glTexParameteri },
@@ -1331,7 +972,7 @@ so_default_dynlib default_dynlib[] = {
         { "glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv },
         { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
         { "glVertexPointer", (uintptr_t)&glVertexPointer_hook },
-        { "glViewport", (uintptr_t)&glViewport_probe },
+        { "glViewport", (uintptr_t)&glViewport },
         { "glWeightPointerOES", (uintptr_t)&ret0 },
 
 
@@ -1351,7 +992,7 @@ so_default_dynlib default_dynlib[] = {
         { "pthread_cond_timedwait", (uintptr_t) &pthread_cond_timedwait_soloader },
         { "pthread_cond_wait", (uintptr_t) &pthread_cond_wait_soloader },
 
-        { "pthread_create", (uintptr_t) &pthread_create_probe },
+        { "pthread_create", (uintptr_t) &pthread_create_soloader },
         { "pthread_detach", (uintptr_t) &pthread_detach_soloader },
         { "pthread_equal", (uintptr_t) &pthread_equal_soloader },
         { "pthread_exit", (uintptr_t)&pthread_exit },
