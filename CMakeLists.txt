@@ -109,6 +109,7 @@ set(SOURCES
     source/java.c
     source/patch.c
     source/reimpl/audio.c
+    source/reimpl/movie.c
     source/reimpl/vsticks.c
     source/reimpl/bits/_ctype.c
     source/reimpl/errno.c
@@ -231,6 +232,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceAppMgr_stub
                       SceAppUtil_stub
                       SceAudio_stub
+SceAvPlayer_stub
+SceSysmodule_stub
                       SceAudioIn_stub
                       SceCommonDialog_stub
                       SceDisplay_stub

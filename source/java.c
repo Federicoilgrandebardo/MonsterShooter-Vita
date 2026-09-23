@@ -11,6 +11,7 @@
 #include <so_util/so_util.h>
 
 #include "utils/logger.h"
+#include "reimpl/movie.h"
 
 extern so_module so_mod;
 
@@ -121,21 +122,20 @@ static jboolean Method_IsOXKeysSwapped(jmethodID id, va_list args) { return 0; }
 static void Method_NoOp(jmethodID id, va_list args) { (void)id; (void)args; }
 
 // Il film lo riprodurrebbe Java: il motore chiama PlayMovie() e poi sonda
-// IsMoviePlaying() finche' non torna false. Rispondendo false a entrambi il
-// gioco salta il filmato e prosegue, che e' il comportamento di oggi.
-// NB qui passa l'aggancio per i filmati veri: PlayMovie riceve il nome
-// ("android_intro.mp4") e l'indice, e IsMoviePlaying fa da guardia della
-// riproduzione. Non serve agganciare nulla nel codice nativo.
+// IsMoviePlaying() finche' non torna false. Qui lo riproduce reimpl/movie.c.
+// PlayMovie riceve il nome SENZA estensione ("android_intro") e l'indice.
+// Se il file manca, false: il gioco salta il filmato e prosegue.
 static jboolean Method_PlayMovie(jmethodID id, va_list args) {
     (void)id;
-    // Sonda: serve sapere COSA chiede il gioco (nome del file e indice) prima di
-    // scrivere il player. Inerte in Release, l_debug li' e' un define vuoto.
     const char * name = jstring_to_cstr(va_arg(args, jstring));
     int idx = va_arg(args, int);
-    l_debug("[MOVIE] PlayMovie(\"%s\", %d) -> false (saltato)", name ? name : "(null)", idx);
-    return 0;
+    (void)idx;
+    return movie_start(name);
 }
-static jboolean Method_IsMoviePlaying(jmethodID id, va_list args) { (void)id; (void)args; return 0; }
+static jboolean Method_IsMoviePlaying(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    return movie_is_playing();
+}
 
 // SDK pubblicitari, analytics e social: i server sono spenti da anni e la Vita
 // non ha ne' banner ne' vibrazione. Senza queste voci ogni chiamata lascia due

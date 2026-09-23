@@ -46,7 +46,17 @@ void gl_init() {
     // VERIFICATO: buffer_count = 1 rompe vitaGL (SCE_GXM_ERROR_INVALID_POINTER
     // nel patching dei vertex shader). Il minimo e' 2. Lascio il default 3 e
     // misuro il rapporto glClear/eglSwapBuffers prima di toccare altro.
-    vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
+    // Soglie = memoria che vitaGL lascia al sistema. vglInitExtended lascia 0
+    // di CDRAM e di phycont: il decoder di sceAvPlayer (filmati) resta senza
+    // memoria e si ferma a 0 frame (VERIFICATO sul ferro, evento STOP).
+    // Il primo argomento e' il pool della modalita' immediata (glBegin/glVertex):
+    // con 0 il quad del filmato crasha in glVertex2f (VERIFICATO, core dump).
+    vglInitWithCustomThreshold(256 * 1024, 960, 544,
+                               16 * 1024 * 1024,  // RAM
+                               16 * 1024 * 1024,  // CDRAM: frame del decoder, ~13 MB
+                               8 * 1024 * 1024,   // phycont
+                               0x8C6000,          // CDLG (valore di vitaGL)
+                               SCE_GXM_MULTISAMPLE_4X);
 }
 
 void gl_swap() {

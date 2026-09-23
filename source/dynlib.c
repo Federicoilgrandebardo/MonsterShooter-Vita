@@ -57,6 +57,7 @@
 #include "reimpl/egl.h"
 #include "reimpl/time64.h"
 #include "reimpl/asset_manager.h"
+#include "reimpl/movie.h"
 
 #ifdef NDK_PORT
 #include <falso_ndk/FalsoNDK.h>
@@ -212,6 +213,14 @@ static int32_t AInputQueue_hasEvents_probe(AInputQueue *q) {
 
 static int32_t AInputQueue_getEvent_probe(AInputQueue *q, AInputEvent **out) {
     int32_t r = AInputQueue_getEvent(q, out);
+    // Su Android il filmato e' una VideoView Java che si prende l'input: il
+    // nativo non vede tasti finche' non finisce. Qui si scartano, altrimenti
+    // un tasto durante cs1 arriva a GameplayJob prima che esista il
+    // GameManager e crasha in GameManager::KeyPressed (VERIFICATO, core dump).
+    while (r >= 0 && movie_active()) {
+        AInputQueue_finishEvent(q, *out, 1);
+        r = AInputQueue_getEvent(q, out);
+    }
     static int budget = 40;
     if (budget > 0 && r >= 0) {
         budget--;
@@ -471,6 +480,7 @@ static unsigned int eglSwapBuffers_probe(void *dpy, void *surf) {
         l_debug("frame %u: clear=%u swap=%u draw=%u (clear/frame %.2f, draw/frame %.1f)",
                 g_swaps, g_clears, g_swaps, g_draws,
                 (double)g_clears / (double)g_swaps, (double)g_draws / (double)g_swaps);
+    movie_draw(); // no-op se non c'e' un filmato
     return eglSwapBuffers(dpy, surf);
 }
 
