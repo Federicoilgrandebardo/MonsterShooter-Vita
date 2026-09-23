@@ -6,9 +6,18 @@ of monsters. This runs the original ARMv7 Android binary through a so-loader,
 with the game's own Claw Engine driving vitaGL underneath.
 
 Playable start to finish: story mode, survival, shop and upgrades, with stereo
-audio and real analog controls instead of the on-screen sticks.
+audio, the original cutscenes and real analog controls instead of the
+on-screen sticks.
 
 ## Changelog
+
+**v1.2**
+
+- Cutscenes: the four original videos now play through `sceAvPlayer`, audio in
+  sync; skip with Cross, Circle, Start or a tap on the screen
+- On-screen touch sticks hide as soon as the analog sticks are used and come
+  back on the first touch
+- Frame pacing checked on hardware: a steady 60 fps in normal play
 
 **v1.0** - first release.
 
@@ -88,11 +97,12 @@ install `monstershooter.vpk` with VitaShell.
 | Triangle | Use health kit |
 | L / L1 | Weapon boost |
 
-The on-screen touch sticks stay visible. This is not an oversight: the engine's
-widgets rewrite the analog vectors every frame, and disabling them
-(`TouchEnabled = false`) kills input altogether. Hiding the controls and driving
-them turned out to be mutually exclusive - the details are at the top of
-`source/reimpl/vsticks.c`, along with four other approaches that did not work.
+| Cross / Circle / Start or a tap | Skip a cutscene |
+
+The on-screen touch sticks disappear as soon as you use the analog sticks and
+come back the moment you touch the screen. They are never switched off - the
+engine reads its input through them - only their quads are left out of the HUD
+draw (`hud_filter` in `source/dynlib.c`).
 
 ## Build Instructions For Developers
 
@@ -122,13 +132,8 @@ With RGBA truecolor, VitaShell rejects the package with error `0x8010113D`.
 
 ## Known Issues
 
-- **Cutscenes are skipped.** The engine asks Java to play them through
-  `PlayMovie` / `IsMoviePlaying`; those are stubbed, so the four `.mp4` files
-  are copied to the Vita but never shown. A `sceAvPlayer` backend is the next
-  thing on the list.
-- **Frame drops with many enemies on screen.** Present since before audio was
-  implemented, never profiled.
-- The on-screen touch controls cannot be hidden, as explained above.
+- **Occasional frame drops with many enemies on screen.** Normal play holds
+  60 fps; the CPU already runs at the maximum userland clocks.
 
 ## Screenshots
 
