@@ -19,16 +19,18 @@
  *    strutture delle dita. Con uno solo sembrava reggere, col secondo si rompeva
  *    tutto. La UI del gioco usa id piccoli, e ora anche noi.
  * 4. Comandi scritti nei vettori analogici del gioco con
- *    GameManager::TouchUpdate, per poter nascondere i controlli a schermo: i
- *    widget touch li riscrivono a ogni frame, e spegnendoli (TouchEnabled =
- *    false in Lua) muore anche l'input. Nascondere i controlli e mantenerli
- *    comandabili sono incompatibili: i controlli restano visibili.
+ *    GameManager::TouchUpdate: i widget touch li riscrivono a ogni frame, e
+ *    spegnendoli (TouchEnabled = false in Lua) muore anche l'input.
+ *
+ * Per nascondere i controlli a schermo i widget restano vivi e se ne salta
+ * solo il disegno (hud_filter in dynlib.c), pilotato da vsticks_hidden.
  */
 
 #include "reimpl/vsticks.h"
 
 #include <math.h>
 #include <psp2/ctrl.h>
+#include <psp2/touch.h>
 #include <so_util/so_util.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -61,6 +63,11 @@ static gm_fn gm_use_healthkit = NULL;
 static gm_fn gm_weapon_boost = NULL;
 
 static bool resolved = false;
+
+// Controlli a schermo: spariscono appena si usano le levette, tornano al primo
+// tocco dello schermo. I widget restano vivi (li legge l'input), si salta solo
+// il disegno dei loro quad: vedi hud_filter in dynlib.c.
+int vsticks_hidden = 0;
 static uint32_t buttons_old = 0;
 
 typedef struct {
@@ -128,6 +135,11 @@ void vsticks_tick(void *app) {
 	// RTRIGGER, quindi la maschera copre entrambe le convenzioni.
 	bool right_active = sqrtf(rx * rx + ry * ry) > VS_DEADZONE
 			|| (pad.buttons & (SCE_CTRL_R1 | SCE_CTRL_RTRIGGER)) != 0;
+
+	SceTouchData touch;
+	sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
+	if (touch.reportNum > 0) vsticks_hidden = 0;
+	else if (left_active || right_active) vsticks_hidden = 1;
 
 	stick_update(&left, app, lx, ly, left_active);
 	stick_update(&right, app, rx, ry, right_active);

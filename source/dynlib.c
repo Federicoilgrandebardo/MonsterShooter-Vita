@@ -58,6 +58,7 @@
 #include "reimpl/time64.h"
 #include "reimpl/asset_manager.h"
 #include "reimpl/movie.h"
+#include "reimpl/vsticks.h"
 
 #ifdef NDK_PORT
 #include <falso_ndk/FalsoNDK.h>
@@ -440,7 +441,92 @@ static void glClear_probe(GLbitfield mask) {
 
 static unsigned g_draws = 0;
 
+// Controlli a schermo nascosti: stato degli array per hud_filter.
+static const void *g_vtx_ptr = NULL;
+static GLint g_vtx_size = 0;
+static GLenum g_vtx_type = 0;
+static GLsizei g_vtx_stride = 0;
+static const float *g_tc_ptr = NULL;
+static GLsizei g_tc_stride = 0;
+static GLenum g_tc_type = 0;
+static GLuint g_vbo = 0, g_ibo = 0;
+
+static void glVertexPointer_hook(GLint size, GLenum type, GLsizei stride, const void *ptr) {
+    g_vtx_size = size; g_vtx_type = type; g_vtx_stride = stride; g_vtx_ptr = ptr;
+    glVertexPointer(size, type, stride, ptr);
+}
+
+static void glTexCoordPointer_hook(GLint size, GLenum type, GLsizei stride, const void *ptr) {
+    g_tc_ptr = ptr; g_tc_stride = stride; g_tc_type = type;
+    glTexCoordPointer(size, type, stride, ptr);
+}
+
+static void glBindBuffer_hook(GLenum target, GLuint buf) {
+    if (target == 0x8892) g_vbo = buf;       // GL_ARRAY_BUFFER
+    else if (target == 0x8893) g_ibo = buf;  // GL_ELEMENT_ARRAY_BUFFER
+    glBindBuffer(target, buf);
+}
+
+// Angolo UV (pixel dell'atlante HUD 2048x2048) delle fette che compongono gli
+// stick a schermo, da un dump sul ferro: base (uguale per i due stick) e
+// pomelli. Lo sprite non cambia quando il pomello si sposta, la posizione si'.
+static const short stick_uv[][2] = {
+    {673,695},{207,950},{712,950},{1647,1028},{1415,1051},{750,1160},       // base
+    {1351,1170},{1143,1190},{1504,1200},{791,1230},{1281,1240},{1200,134},
+    {984,642},{1435,1240},{1175,1250},{1138,1260},{1594,1280},{54,1374},   // pomello
+    {897,642},{1204,1240},{1246,1250},{1463,1260},{1,1290},{97,1374},      // pomello
+};
+static GLuint g_hud_tex = 0; // atlante HUD, riconosciuto al primo frame con gli stick
+
+static unsigned idx_at(GLenum type, const void *idx, int i) {
+    return type == 0x1401 ? ((const unsigned char *)idx)[i] : ((const unsigned short *)idx)[i];
+}
+
+// 1 se il quad [q, q+6) e' una fetta di stick nella meta' bassa dello schermo.
+static int is_stick_quad(GLenum type, const void *idx, int q) {
+    int vstride = g_vtx_stride ? g_vtx_stride : g_vtx_size * 4;
+    int tstride = g_tc_stride ? g_tc_stride : 8;
+    float u0 = 1e9f, v0 = 1e9f, ymin = 1e9f;
+    for (int i = q; i < q + 6; i++) {
+        unsigned k = idx_at(type, idx, i);
+        const float *p = (const float *)((const unsigned char *)g_vtx_ptr + k * vstride);
+        const float *t = (const float *)((const unsigned char *)g_tc_ptr + k * tstride);
+        if (t[0] < u0) u0 = t[0];
+        if (t[1] < v0) v0 = t[1];
+        if (p[1] < ymin) ymin = p[1];
+    }
+    if (ymin < 300.f) return 0;
+    int u = (int)(u0 * 2048.f + .5f), v = (int)(v0 * 2048.f + .5f);
+    for (unsigned j = 0; j < sizeof(stick_uv) / sizeof(stick_uv[0]); j++)
+        if (abs(u - stick_uv[j][0]) <= 1 && abs(v - stick_uv[j][1]) <= 1)
+            return 1;
+    return 0;
+}
+
+// Ridisegna la draw HUD senza i quad degli stick. 0 = non era la draw giusta.
+static int hud_filter(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+    static unsigned short out[6144];
+    if (mode != 4 || count % 6 || count > 6144 || g_vbo || g_ibo || !g_vtx_ptr || !g_tc_ptr
+        || g_vtx_type != 0x1406 || g_tc_type != 0x1406 || (type != 0x1403 && type != 0x1401))
+        return 0;
+    if (g_hud_tex && g_bound_tex[0] != g_hud_tex) return 0;
+    if (!g_hud_tex && count < 144) return 0;
+    int n = 0, dropped = 0;
+    for (int q = 0; q < count; q += 6) {
+        if (is_stick_quad(type, idx, q)) { dropped++; continue; }
+        for (int i = q; i < q + 6; i++) out[n++] = idx_at(type, idx, i);
+    }
+    if (!g_hud_tex) {
+        if (dropped < 24) return 0; // non e' l'atlante HUD
+        g_hud_tex = g_bound_tex[0];
+        l_info("[HUD] atlante dei controlli: texture %u", g_hud_tex);
+    }
+    if (n) glDrawElements(mode, n, 0x1403, out);
+    return 1;
+}
+
 static void glDrawElements_probe(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+    if (vsticks_hidden && hud_filter(mode, count, type, idx)) return;
     g_draws++;
     g_draws_since_clear++;
     // "draw UI" = quad da 6 indici con texture attiva: sono le icone.
@@ -997,7 +1083,7 @@ so_default_dynlib default_dynlib[] = {
         { "glAlphaFuncx", (uintptr_t)&glAlphaFuncx },
         { "glAttachShader", (uintptr_t)&glAttachShader },
         { "glBindAttribLocation", (uintptr_t)&glBindAttribLocation },
-        { "glBindBuffer", (uintptr_t)&glBindBuffer },
+        { "glBindBuffer", (uintptr_t)&glBindBuffer_hook },
         { "glBindFramebuffer", (uintptr_t)&glBindFramebuffer },
         { "glBindFramebufferOES", (uintptr_t)&glBindFramebufferOES_probe },
         { "glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer },
@@ -1195,7 +1281,7 @@ so_default_dynlib default_dynlib[] = {
         { "glStencilMask", (uintptr_t)&glStencilMask },
         { "glStencilOp", (uintptr_t)&glStencilOp },
         { "glStencilOpSeparate", (uintptr_t)&glStencilOpSeparate },
-        { "glTexCoordPointer", (uintptr_t)&glTexCoordPointer },
+        { "glTexCoordPointer", (uintptr_t)&glTexCoordPointer_hook },
         { "glTexEnvf", (uintptr_t)&glTexEnvf },
         { "glTexEnvfv", (uintptr_t)&glTexEnvfv_probe },
         { "glTexEnvi", (uintptr_t)&glTexEnvi_probe },
@@ -1244,7 +1330,7 @@ so_default_dynlib default_dynlib[] = {
         { "glVertexAttrib4f", (uintptr_t)&glVertexAttrib4f },
         { "glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv },
         { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
-        { "glVertexPointer", (uintptr_t)&glVertexPointer },
+        { "glVertexPointer", (uintptr_t)&glVertexPointer_hook },
         { "glViewport", (uintptr_t)&glViewport_probe },
         { "glWeightPointerOES", (uintptr_t)&ret0 },
 

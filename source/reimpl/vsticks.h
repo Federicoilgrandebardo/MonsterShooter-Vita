@@ -8,6 +8,9 @@
 
 void vsticks_init(void);
 
+/// 1 = non disegnare i controlli a schermo (levette in uso, nessun tocco).
+extern int vsticks_hidden;
+
 /// Va chiamata sul thread del gioco, dallo hook su AbstractApp::PrivateTick.
 void vsticks_tick(void *app);
 
